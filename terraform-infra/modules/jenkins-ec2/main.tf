@@ -18,7 +18,7 @@ resource "aws_instance" "terraform_ec2_jenkins" {
 
   associate_public_ip_address = true
 
-  user_data = file("${path.module}/ec2-jenkins-user-data-LAPTOP-RR2OIRHC.sh")
+  user_data = file("${path.module}/ec2-jenkins-user-data.sh")
 
   root_block_device {
     volume_size = 30
