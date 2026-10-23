@@ -1,0 +1,307 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    environment {
+        AWS_REGION          = 'ap-south-1'
+        EKS_CLUSTER         = 'demo-eks-cluster'
+        ECR_REPOSITORY      = 'ecommerce-app-dev-frontend'
+
+        K8S_NAMESPACE       = 'development'
+        APP_RELEASE         = 'frontend'
+
+        LBC_RELEASE         = 'aws-load-balancer-controller'
+        LBC_CHART_VERSION   = '1.14.0'
+
+        ACCOUNT_ID          = ''
+        ECR_REGISTRY        = ''
+        ECR_URI             = ''
+        IMAGE_TAG           = ''
+        VPC_ID              = ''
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Tools and AWS Access') {
+            steps {
+                sh '''
+                    set -eu
+
+                    command -v aws
+                    command -v kubectl
+                    command -v helm
+                    command -v docker
+
+                    echo "Checking AWS identity..."
+                    aws sts get-caller-identity
+                '''
+
+                script {
+                    env.ACCOUNT_ID = sh(
+                        script: 'aws sts get-caller-identity --query Account --output text',
+                        returnStdout: true
+                    ).trim()
+
+                    env.ECR_REGISTRY =
+                        "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+
+                    env.ECR_URI =
+                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}"
+
+                    def shortCommit = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG =
+                        "${env.BUILD_NUMBER}-${shortCommit}"
+
+                    env.VPC_ID = sh(
+                        script: """
+                            aws eks describe-cluster \
+                              --name '${env.EKS_CLUSTER}' \
+                              --region '${env.AWS_REGION}' \
+                              --query 'cluster.resourcesVpcConfig.vpcId' \
+                              --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!env.ACCOUNT_ID || !env.VPC_ID ||
+                        env.VPC_ID == 'None') {
+                        error('Could not determine AWS account or EKS VPC.')
+                    }
+
+                    echo "EKS cluster: ${env.EKS_CLUSTER}"
+                    echo "ECR repository: ${env.ECR_URI}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                    echo "VPC: ${env.VPC_ID}"
+                }
+
+                sh '''
+                    set -eu
+
+                    aws ecr describe-repositories \
+                      --repository-names "$ECR_REPOSITORY" \
+                      --region "$AWS_REGION" >/dev/null
+
+                    echo "AWS identity and ECR repository verified."
+                '''
+            }
+        }
+
+        stage('Configure kubectl') {
+            steps {
+                sh '''
+                    set -eu
+
+                    aws eks update-kubeconfig \
+                      --region "$AWS_REGION" \
+                      --name "$EKS_CLUSTER"
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Build and Push Frontend Image') {
+            steps {
+                sh '''
+                    set -eu
+
+                    aws ecr get-login-password \
+                      --region "$AWS_REGION" |
+                    docker login \
+                      --username AWS \
+                      --password-stdin "$ECR_REGISTRY"
+                '''
+
+                dir('helm-k8s-deployment') {
+                    sh '''
+                        set -eu
+
+                        docker build \
+                          --pull \
+                          --tag "$ECR_URI:$IMAGE_TAG" \
+                          .
+
+                        docker push "$ECR_URI:$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Install AWS Load Balancer Controller') {
+            steps {
+                sh '''
+                    set -eu
+
+                    helm repo add eks \
+                      https://aws.github.io/eks-charts \
+                      --force-update
+
+                    helm repo update eks
+
+                    helm upgrade --install "$LBC_RELEASE" \
+                      eks/aws-load-balancer-controller \
+                      --namespace kube-system \
+                      --version "$LBC_CHART_VERSION" \
+                      --set clusterName="$EKS_CLUSTER" \
+                      --set region="$AWS_REGION" \
+                      --set vpcId="$VPC_ID" \
+                      --set serviceAccount.create=true \
+                      --set serviceAccount.name=aws-load-balancer-controller \
+                      --wait \
+                      --atomic \
+                      --timeout 5m
+                '''
+            }
+        }
+
+        stage('Verify AWS Load Balancer Controller') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Waiting for controller deployment..."
+
+                    kubectl rollout status \
+                      deployment/aws-load-balancer-controller \
+                      --namespace kube-system \
+                      --timeout=180s
+
+                    kubectl get deployment \
+                      aws-load-balancer-controller \
+                      --namespace kube-system
+
+                    kubectl get pods \
+                      --namespace kube-system
+
+                    echo "Controller deployment is ready."
+                '''
+            }
+        }
+
+        stage('Deploy Frontend Helm Chart') {
+            steps {
+                dir('helm-k8s-deployment') {
+                    sh '''
+                        set -eu
+
+                        helm upgrade --install "$APP_RELEASE" \
+                          ./charts/frontend-chart \
+                          --namespace "$K8S_NAMESPACE" \
+                          --create-namespace \
+                          --values ./charts/frontend-chart/values-dev.yaml \
+                          --set-string image.repository="$ECR_URI" \
+                          --set-string image.tag="$IMAGE_TAG" \
+                          --wait \
+                          --atomic \
+                          --timeout 5m
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Frontend Deployment') {
+            steps {
+                sh '''
+                    set -eu
+
+                    kubectl rollout status \
+                      "deployment/$APP_RELEASE" \
+                      --namespace "$K8S_NAMESPACE" \
+                      --timeout=180s
+
+                    kubectl get deployments \
+                      --namespace "$K8S_NAMESPACE"
+
+                    kubectl get pods \
+                      --namespace "$K8S_NAMESPACE"
+
+                    kubectl get services \
+                      --namespace "$K8S_NAMESPACE"
+
+                    kubectl get ingress \
+                      --namespace "$K8S_NAMESPACE"
+                '''
+            }
+        }
+
+        stage('Verify ALB Provisioning') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Waiting for Ingress to receive an ALB hostname..."
+
+                    ALB_DNS=""
+
+                    for attempt in $(seq 1 30); do
+                        ALB_DNS=$(kubectl get ingress frontend-ingress \
+                          --namespace "$K8S_NAMESPACE" \
+                          --output jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+                        if [ -n "$ALB_DNS" ]; then
+                            break
+                        fi
+
+                        echo "ALB not assigned yet ($attempt/30)."
+                        sleep 10
+                    done
+
+                    if [ -z "$ALB_DNS" ]; then
+                        echo "Ingress has no ALB hostname."
+                        kubectl describe ingress frontend-ingress \
+                          --namespace "$K8S_NAMESPACE"
+                        kubectl logs \
+                          deployment/aws-load-balancer-controller \
+                          --namespace kube-system \
+                          --tail=100
+                        exit 1
+                    fi
+
+                    echo "ALB hostname: $ALB_DNS"
+                    echo "ALB provisioning verification passed."
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI/CD pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Review the first failed stage and its logs.'
+            echo 'Application Helm upgrades use --atomic for failure recovery.'
+        }
+
+        always {
+            sh '''
+                if [ -n "$ECR_URI" ] && [ -n "$IMAGE_TAG" ]; then
+                    docker image rm "$ECR_URI:$IMAGE_TAG" || true
+                fi
+            '''
+
+            cleanWs()
+        }
+    }
+}
+
+// ## Senior DevOps takeaway: Terraform should create the infrastructure, while Jenkins can 
+// ## query AWS for infrastructure metadata it needs. This reduces duplicated configuration 
+// ## and prevents account IDs and VPC IDs from becoming stale in your CI/CD pipeline.
