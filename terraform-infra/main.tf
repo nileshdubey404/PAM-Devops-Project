@@ -132,6 +132,9 @@ resource "aws_eks_access_entry" "jenkins_access_entry" {
   principal_arn = module.iam.jenkins_role_arn
 
   type = "STANDARD"
+  depends_on = [
+    module.eks
+  ]
 }
 # The AWS provider currently supports aws_eks_access_entry with cluster_name, principal_arn, 
 # type, and optional Kubernetes groups
