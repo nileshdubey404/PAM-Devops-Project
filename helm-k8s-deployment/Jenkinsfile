@@ -35,87 +35,76 @@ pipeline {
         }
 
         stage('Validate Tools and AWS Access') {
-            steps {
-                sh '''
-                    set -eu
+    steps {
+        sh '''
+            set -eu
+            command -v aws
+            command -v kubectl
+            command -v helm
+            command -v docker
 
-                    command -v aws
-                    command -v kubectl
-                    command -v helm
-                    command -v docker
+            aws sts get-caller-identity
+        '''
 
-                    echo "Checking AWS identity..."
-                    aws sts get-caller-identity
-                '''
+        script {
+            env.ACCOUNT_ID = sh(
+                script: 'aws sts get-caller-identity --query Account --output text',
+                returnStdout: true
+            ).trim()
 
-                script {
-                    env.ACCOUNT_ID = sh(
-                        script: 'aws sts get-caller-identity --query Account --output text',
-                        returnStdout: true
-                    ).trim()
+            env.ECR_REGISTRY =
+                "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
 
-                    env.ECR_REGISTRY =
-                        "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+            env.ECR_URI =
+                "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}"
 
-                    env.ECR_URI =
-                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}"
+            def shortCommit = sh(
+                script: 'git rev-parse --short=7 HEAD',
+                returnStdout: true
+            ).trim()
 
-                    def shortCommit = sh(
-                        script: 'git rev-parse --short=7 HEAD',
-                        returnStdout: true
-                    ).trim()
+            env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortCommit}"
 
-                    env.IMAGE_TAG =
-                        "${env.BUILD_NUMBER}-${shortCommit}"
-
-                    env.VPC_ID = sh(
-                        script: """
-                            aws eks describe-cluster \
-                              --name '${env.EKS_CLUSTER}' \
-                              --region '${env.AWS_REGION}' \
-                              --query 'cluster.resourcesVpcConfig.vpcId' \
-                              --output text
-                        """,
-                        returnStdout: true
-                    ).trim()
-
-                    if (!env.ACCOUNT_ID || !env.VPC_ID ||
-                        env.VPC_ID == 'None') {
-                        error('Could not determine AWS account or EKS VPC.')
-                    }
-
-                    echo "EKS cluster: ${env.EKS_CLUSTER}"
-                    echo "ECR repository: ${env.ECR_URI}"
-                    echo "Image tag: ${env.IMAGE_TAG}"
-                    echo "VPC: ${env.VPC_ID}"
-                }
-
-                sh '''
-                    set -eu
-
-                    aws ecr describe-repositories \
-                      --repository-names "$ECR_REPOSITORY" \
-                      --region "$AWS_REGION" >/dev/null
-
-                    echo "AWS identity and ECR repository verified."
-                '''
+            try {
+                env.VPC_ID = sh(
+                    script: """
+                        aws eks describe-cluster \
+                          --name '${env.EKS_CLUSTER}' \
+                          --region '${env.AWS_REGION}' \
+                          --query 'cluster.resourcesVpcConfig.vpcId' \
+                          --output text
+                    """,
+                    returnStdout: true
+                ).trim()
+            } catch (Exception ex) {
+                error("""
+                        EKS cluster lookup failed.
+                        Cluster: ${env.EKS_CLUSTER}
+                        Region: ${env.AWS_REGION}
+                        Verify that the Jenkins EC2 IAM role has eks:DescribeCluster
+                        permission and that the cluster exists in this region.
+                    """)
             }
+
+            if (!env.VPC_ID || env.VPC_ID == 'None') {
+                error('EKS returned an empty VPC ID.')
+            }
+
+            echo "AWS Account: ${env.ACCOUNT_ID}"
+            echo "EKS Cluster: ${env.EKS_CLUSTER}"
+            echo "ECR Repository: ${env.ECR_URI}"
+            echo "Image Tag: ${env.IMAGE_TAG}"
+            echo "VPC ID: ${env.VPC_ID}"
         }
 
-        stage('Configure kubectl') {
-            steps {
-                sh '''
-                    set -eu
-
-                    aws eks update-kubeconfig \
-                      --region "$AWS_REGION" \
-                      --name "$EKS_CLUSTER"
-
-                    kubectl get nodes
-                '''
-            }
-        }
-
+        sh '''
+            set -eu
+            aws ecr describe-repositories \
+              --repository-names "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" >/dev/null
+        '''
+    }
+}
         stage('Build and Push Frontend Image') {
             steps {
                 sh '''

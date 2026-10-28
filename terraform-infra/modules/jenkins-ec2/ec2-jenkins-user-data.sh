@@ -169,20 +169,39 @@ install -o root -g root -m 0755 \
 rm -f /tmp/kubectl /tmp/kubectl.sha256
 
 # ------------------------------------------------------------
-# 6. HELM OFFICIAL APT REPOSITORY
+# 6. HELM INSTALLATION (OFFICIAL RELEASE BINARY)
 # ------------------------------------------------------------
 
-curl -fsSL https://baltocdn.com/helm/signing.asc \
-    -o /etc/apt/keyrings/helm.asc
+# Pin the version for reproducible provisioning.
+HELM_VERSION="v3.18.6"
 
-chmod 0644 /etc/apt/keyrings/helm.asc
+case "$ARCH" in
+    amd64)
+        HELM_ARCH="amd64"
+        ;;
+    arm64)
+        HELM_ARCH="arm64"
+        ;;
+    *)
+        echo "ERROR: Unsupported Helm architecture: $ARCH"
+        exit 1
+        ;;
+esac
 
-cat > /etc/apt/sources.list.d/helm-stable-debian.list <<'EOF'
-deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/helm.asc] https://baltocdn.com/helm/stable/debian/ all main
-EOF
+curl -fsSL \
+    "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" \
+    -o /tmp/helm.tar.gz
 
-apt-get update
-apt-get install -y helm
+tar -xzf /tmp/helm.tar.gz -C /tmp
+
+install -o root -g root -m 0755 \
+    "/tmp/linux-${HELM_ARCH}/helm" \
+    /usr/local/bin/helm
+
+rm -rf /tmp/helm.tar.gz "/tmp/linux-${HELM_ARCH}"
+
+# Verify installation
+helm version --short
 
 # ------------------------------------------------------------
 # 7. TERRAFORM OFFICIAL APT REPOSITORY
